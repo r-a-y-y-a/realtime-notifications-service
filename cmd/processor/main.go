@@ -102,7 +102,9 @@ func processMessage(ctx context.Context, msg kafka.Message, rdb *redis.Client, p
 	)
 	if err != nil {
 		// Roll back idempotency key so we can retry
-		rdb.Del(ctx, idempotencyKey)
+		if delErr := rdb.Del(ctx, idempotencyKey).Err(); delErr != nil {
+			slog.Error("redis del idempotency key error", "err", delErr, "key", idempotencyKey)
+		}
 		return err
 	}
 
