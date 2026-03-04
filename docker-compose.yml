@@ -1,0 +1,86 @@
+version: "3.9"
+
+services:
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    ports:
+      - "2181:2181"
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: "yes"
+
+  kafka:
+    image: bitnami/kafka:3.6
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: notifications
+      POSTGRES_PASSWORD: notifications
+      POSTGRES_DB: notifications
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8080:8080"
+    depends_on:
+      - kafka
+      - postgres
+      - redis
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: notification_requests
+      REDIS_ADDR: redis:6379
+      POSTGRES_DSN: postgres://notifications:notifications@postgres:5432/notifications?sslmode=disable
+      API_PORT: "8080"
+      RATE_LIMIT_PER_MINUTE: "20"
+
+  processor:
+    build:
+      context: .
+      dockerfile: Dockerfile.processor
+    depends_on:
+      - kafka
+      - postgres
+      - redis
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: notification_requests
+      REDIS_ADDR: redis:6379
+      POSTGRES_DSN: postgres://notifications:notifications@postgres:5432/notifications?sslmode=disable
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    environment:
+      REDIS_ADDR: redis:6379
+      GATEWAY_PORT: "8081"
+
+volumes:
+  postgres_data:
