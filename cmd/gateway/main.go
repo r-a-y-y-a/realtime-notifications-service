@@ -15,6 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/r-a-y-y-a/realtime-notifications-service/internal/config"
+	"github.com/r-a-y-y-a/realtime-notifications-service/internal/infra"
 )
 
 var upgrader = websocket.Upgrader{
@@ -30,7 +31,11 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	rdb := connectRedis(ctx, cfg.RedisAddr)
+	rdb, err := infra.ConnectRedis(ctx, cfg.RedisAddr)
+	if err != nil {
+		slog.Error("failed to connect to Redis", "err", err)
+		os.Exit(1)
+	}
 	defer rdb.Close()
 
 	mux := http.NewServeMux()
@@ -156,26 +161,6 @@ func sseHandler(rdb *redis.Client) http.HandlerFunc {
 				fmt.Fprintf(w, "data: %s\n\n", msg.Payload)
 				flusher.Flush()
 			}
-		}
-	}
-}
-
-func connectRedis(ctx context.Context, addr string) *redis.Client {
-	rdb := redis.NewClient(&redis.Options{Addr: addr})
-	backoff := time.Second
-	for {
-		if err := rdb.Ping(ctx).Err(); err == nil {
-			slog.Info("connected to Redis", "addr", addr)
-			return rdb
-		}
-		slog.Warn("waiting for Redis", "addr", addr, "retry_in", backoff)
-		select {
-		case <-ctx.Done():
-			os.Exit(1)
-		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
 		}
 	}
 }

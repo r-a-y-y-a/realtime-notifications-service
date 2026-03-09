@@ -16,6 +16,7 @@ import (
 	kafka "github.com/segmentio/kafka-go"
 
 	"github.com/r-a-y-y-a/realtime-notifications-service/internal/config"
+	"github.com/r-a-y-y-a/realtime-notifications-service/internal/infra"
 	"github.com/r-a-y-y-a/realtime-notifications-service/internal/models"
 )
 
@@ -28,10 +29,18 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	rdb := connectRedis(ctx, cfg.RedisAddr)
+	rdb, err := infra.ConnectRedis(ctx, cfg.RedisAddr)
+	if err != nil {
+		slog.Error("failed to connect to Redis", "err", err)
+		os.Exit(1)
+	}
 	defer rdb.Close()
 
-	pool := connectPostgres(ctx, cfg.PostgresDSN)
+	pool, err := infra.ConnectPostgres(ctx, cfg.PostgresDSN)
+	if err != nil {
+		slog.Error("failed to connect to Postgres", "err", err)
+		os.Exit(1)
+	}
 	defer pool.Close()
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
@@ -127,47 +136,4 @@ func processMessage(ctx context.Context, msg kafka.Message, rdb *redis.Client, p
 
 	slog.Info("notification processed", "id", notif.ID, "user_id", notif.UserID)
 	return nil
-}
-
-func connectRedis(ctx context.Context, addr string) *redis.Client {
-	rdb := redis.NewClient(&redis.Options{Addr: addr})
-	backoff := time.Second
-	for {
-		if err := rdb.Ping(ctx).Err(); err == nil {
-			slog.Info("connected to Redis", "addr", addr)
-			return rdb
-		}
-		slog.Warn("waiting for Redis", "addr", addr, "retry_in", backoff)
-		select {
-		case <-ctx.Done():
-			os.Exit(1)
-		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
-	}
-}
-
-func connectPostgres(ctx context.Context, dsn string) *pgxpool.Pool {
-	backoff := time.Second
-	for {
-		pool, err := pgxpool.New(ctx, dsn)
-		if err == nil {
-			if err = pool.Ping(ctx); err == nil {
-				slog.Info("connected to Postgres")
-				return pool
-			}
-			pool.Close()
-		}
-		slog.Warn("waiting for Postgres", "retry_in", backoff, "err", err)
-		select {
-		case <-ctx.Done():
-			os.Exit(1)
-		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
-	}
 }

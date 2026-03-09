@@ -20,6 +20,7 @@ import (
 	kafka "github.com/segmentio/kafka-go"
 
 	"github.com/r-a-y-y-a/realtime-notifications-service/internal/config"
+	"github.com/r-a-y-y-a/realtime-notifications-service/internal/infra"
 	"github.com/r-a-y-y-a/realtime-notifications-service/internal/models"
 )
 
@@ -35,11 +36,19 @@ func main() {
 	defer cancel()
 
 	// Connect to Redis with retry
-	rdb := connectRedis(ctx, cfg.RedisAddr)
+	rdb, err := infra.ConnectRedis(ctx, cfg.RedisAddr)
+	if err != nil {
+		slog.Error("failed to connect to Redis", "err", err)
+		os.Exit(1)
+	}
 	defer rdb.Close()
 
 	// Connect to Postgres with retry
-	pool := connectPostgres(ctx, cfg.PostgresDSN)
+	pool, err := infra.ConnectPostgres(ctx, cfg.PostgresDSN)
+	if err != nil {
+		slog.Error("failed to connect to Postgres", "err", err)
+		os.Exit(1)
+	}
 	defer pool.Close()
 
 	// Create Kafka writer
@@ -109,6 +118,11 @@ func postNotificationHandler(cfg *config.Config, rdb *redis.Client, writer *kafk
 
 		if req.UserID == "" || req.TenantID == "" || req.Title == "" || req.Body == "" || req.Channel == "" {
 			jsonError(w, "missing required fields", http.StatusBadRequest)
+			return
+		}
+
+		if req.Channel != "push" && req.Channel != "email" && req.Channel != "sms" {
+			jsonError(w, "invalid channel: must be push, email, or sms", http.StatusBadRequest)
 			return
 		}
 
@@ -209,49 +223,6 @@ func getUserNotificationsHandler(pool *pgxpool.Pool) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(notifications)
-	}
-}
-
-func connectRedis(ctx context.Context, addr string) *redis.Client {
-	rdb := redis.NewClient(&redis.Options{Addr: addr})
-	backoff := time.Second
-	for {
-		if err := rdb.Ping(ctx).Err(); err == nil {
-			slog.Info("connected to Redis", "addr", addr)
-			return rdb
-		}
-		slog.Warn("waiting for Redis", "addr", addr, "retry_in", backoff)
-		select {
-		case <-ctx.Done():
-			os.Exit(1)
-		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
-	}
-}
-
-func connectPostgres(ctx context.Context, dsn string) *pgxpool.Pool {
-	backoff := time.Second
-	for {
-		pool, err := pgxpool.New(ctx, dsn)
-		if err == nil {
-			if err = pool.Ping(ctx); err == nil {
-				slog.Info("connected to Postgres")
-				return pool
-			}
-			pool.Close()
-		}
-		slog.Warn("waiting for Postgres", "retry_in", backoff, "err", err)
-		select {
-		case <-ctx.Done():
-			os.Exit(1)
-		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
 	}
 }
 
