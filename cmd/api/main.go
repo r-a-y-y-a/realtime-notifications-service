@@ -101,10 +101,12 @@ func postNotificationHandler(cfg *config.Config, rdb *redis.Client, writer *kafk
 			Body     string `json:"body"`
 			Channel  string `json:"channel"`
 		}
+
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			jsonError(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
+
 		if req.UserID == "" || req.TenantID == "" || req.Title == "" || req.Body == "" || req.Channel == "" {
 			jsonError(w, "missing required fields", http.StatusBadRequest)
 			return
