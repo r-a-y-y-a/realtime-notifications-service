@@ -9,6 +9,7 @@ import (
 type Config struct {
 	KafkaBrokers       string
 	KafkaTopic         string
+	KafkaDLQTopic      string
 	RedisAddr          string
 	PostgresDSN        string
 	APIPort            string
@@ -37,6 +38,7 @@ func Load() *Config {
 	return &Config{
 		KafkaBrokers:       getEnv("KAFKA_BROKERS", "kafka:9092"),
 		KafkaTopic:         getEnv("KAFKA_TOPIC", "notification_requests"),
+		KafkaDLQTopic:      getEnv("KAFKA_DLQ_TOPIC", "notification_requests_dlq"),
 		RedisAddr:          getEnv("REDIS_ADDR", "redis:6379"),
 		PostgresDSN:        getEnv("POSTGRES_DSN", "postgres://notifications:notifications@postgres:5432/notifications?sslmode=disable"),
 		APIPort:            getEnv("API_PORT", "8080"),

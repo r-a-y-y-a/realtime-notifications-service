@@ -221,6 +221,13 @@ func getUserNotificationsHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			notifications = append(notifications, n)
 		}
 
+		// Check for iteration errors
+		if err := rows.Err(); err != nil {
+			slog.Error("postgres rows iteration error", "err", err)
+			jsonError(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(notifications)
 	}

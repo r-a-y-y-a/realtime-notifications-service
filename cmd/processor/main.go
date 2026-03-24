@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -50,6 +51,14 @@ func main() {
 	})
 	defer reader.Close()
 
+	dlqWriter := &kafka.Writer{
+		Addr:         kafka.TCP(strings.Split(cfg.KafkaBrokers, ",")...),
+		Topic:        cfg.KafkaDLQTopic,
+		Balancer:     &kafka.Hash{},
+		RequiredAcks: kafka.RequireOne,
+	}
+	defer dlqWriter.Close()
+
 	slog.Info("processor started, consuming messages")
 
 	for {
@@ -64,8 +73,22 @@ func main() {
 		}
 
 		if err := processMessage(ctx, msg, rdb, pool); err != nil {
-			slog.Error("processing failed", "err", err, "offset", msg.Offset)
-			// Still commit to avoid infinite retry loops; a DLQ would be used in production
+			slog.Error("processing failed, sending to DLQ",
+				"err", err, "offset", msg.Offset, "topic", cfg.KafkaDLQTopic)
+
+			// Send to DLQ for manual inspection/retry
+			dlqMsg := kafka.Message{
+				Key:   msg.Key,
+				Value: msg.Value,
+				Headers: []kafka.Header{
+					{Key: "error", Value: []byte(err.Error())},
+					{Key: "original_offset", Value: []byte(strconv.FormatInt(msg.Offset, 10))},
+				},
+			}
+			if dlqErr := dlqWriter.WriteMessages(ctx, dlqMsg); dlqErr != nil {
+				slog.Error("DLQ write failed — message will be lost",
+					"dlq_err", dlqErr, "original_offset", msg.Offset)
+			}
 		}
 
 		if err := reader.CommitMessages(ctx, msg); err != nil {
@@ -81,15 +104,26 @@ func processMessage(ctx context.Context, msg kafka.Message, rdb *redis.Client, p
 		return nil // malformed message; skip
 	}
 
-	// Idempotency check via Redis SETNX
-	idempotencyKey := "processed:" + req.RequestID
-	set, err := rdb.SetNX(ctx, idempotencyKey, 1, 24*time.Hour).Result()
+	// Idempotency and notification persistence in a single Postgres transaction
+	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if !set {
+	defer tx.Rollback(ctx)
+
+	// Record that we've processed this request_id (duplicate check via unique constraint)
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO processed_requests (request_id) VALUES ($1) ON CONFLICT DO NOTHING`,
+		req.RequestID,
+	)
+	if err != nil {
+		return err
+	}
+
+	// If 0 rows affected, this message was already processed
+	if tag.RowsAffected() == 0 {
 		slog.Info("duplicate message skipped", "request_id", req.RequestID)
-		return nil
+		return tx.Rollback(ctx)
 	}
 
 	notif := models.Notification{
@@ -103,21 +137,22 @@ func processMessage(ctx context.Context, msg kafka.Message, rdb *redis.Client, p
 		CreatedAt: time.Now().UTC(),
 	}
 
-	// Insert into Postgres
-	_, err = pool.Exec(ctx,
+	// Insert notification in same transaction
+	_, err = tx.Exec(ctx,
 		`INSERT INTO notifications (id, user_id, tenant_id, title, body, channel, status, created_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		notif.ID, notif.UserID, notif.TenantID, notif.Title, notif.Body, notif.Channel, notif.Status, notif.CreatedAt,
 	)
 	if err != nil {
-		// Roll back idempotency key so we can retry
-		if delErr := rdb.Del(ctx, idempotencyKey).Err(); delErr != nil {
-			slog.Error("redis del idempotency key error", "err", delErr, "key", idempotencyKey)
-		}
 		return err
 	}
 
-	// Update Redis unread count and list; log but don't fail on Redis errors
+	// Commit transaction (atomic: both inserts succeed or both fail)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	// Post-commit Redis updates (best-effort, non-critical)
 	if err := rdb.Incr(ctx, "user:"+notif.UserID+":unread_count").Err(); err != nil {
 		slog.Error("redis incr unread_count error", "err", err, "user_id", notif.UserID)
 	}
