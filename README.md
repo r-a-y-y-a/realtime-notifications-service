@@ -28,7 +28,11 @@ A production-quality, real-time notifications service built in Go using a multi-
 
 1. A client POSTs a notification request to the **API Service**.
 2. The API validates the request, enforces per-user/tenant rate limits via Redis, and publishes a `NotificationRequest` JSON message to a Kafka topic (keyed by `user_id` for ordering).
-3. The **Processor Service** consumes from Kafka, deduplicates via Redis `SETNX`, persists the notification to Postgres, updates Redis unread counters, and publishes the full `Notification` JSON to a Redis Pub/Sub channel.
+3. The **Processor Service** consumes from Kafka with exactly-once semantics:
+   - Deduplicates via a Postgres transaction using the `processed_requests` table (durable, survives Redis restarts).
+   - Persists the notification to Postgres within the same transaction.
+   - On failure, writes the message to a Dead Letter Queue (DLQ) for manual inspection and retry.
+   - Updates Redis unread counters (best-effort) and publishes the full `Notification` JSON to a Redis Pub/Sub channel.
 4. The **Gateway Service** maintains long-lived WebSocket or SSE connections. Each connection subscribes to `notifications:{userID}` on Redis and streams messages to the client in real time.
 
 ## Prerequisites
@@ -124,7 +128,8 @@ All services are configured via environment variables:
 | Variable              | Default                                                                 | Description                          |
 |-----------------------|-------------------------------------------------------------------------|--------------------------------------|
 | `KAFKA_BROKERS`       | `kafka:9092`                                                            | Comma-separated Kafka broker list    |
-| `KAFKA_TOPIC`         | `notification_requests`                                                 | Kafka topic name                     |
+| `KAFKA_TOPIC`         | `notification_requests`                                                 | Kafka topic for notifications        |
+| `KAFKA_DLQ_TOPIC`     | `notification_requests_dlq`                                             | Kafka topic for failed messages (DLQ) |
 | `REDIS_ADDR`          | `redis:6379`                                                            | Redis address                        |
 | `POSTGRES_DSN`        | `postgres://notifications:notifications@postgres:5432/notifications?sslmode=disable` | Postgres connection string |
 | `API_PORT`            | `8080`                                                                  | Port for the API service             |
@@ -135,10 +140,11 @@ All services are configured via environment variables:
 
 - **Kafka for durability**: Decouples ingestion from processing. If the processor is down, messages queue up and are processed when it recovers.
 - **Kafka keyed by user_id**: Guarantees per-user message ordering without a global lock.
-- **Redis idempotency (`SETNX`)**: Protects against Kafka at-least-once redelivery at the processor level. TTL of 24h limits memory growth.
-- **Redis Pub/Sub for real-time delivery**: Low-latency fan-out to connected WebSocket/SSE clients without polling Postgres.
+- **Postgres idempotency (exactly-once semantics)**: Notification insertion and idempotency check happen in a single atomic transaction using the `processed_requests` table. This is durable, survives Redis restarts, and eliminates race conditions. Failed messages are not lost even if intermediate operations fail.
+- **Dead Letter Queue (DLQ)**: Processing failures write to `notification_requests_dlq` for manual inspection and retry instead of silently discarding messages. Kafka offsets are still committed to prevent infinite retry loops.
+- **Redis Pub/Sub for real-time delivery**: Low-latency fan-out to connected WebSocket/SSE clients without polling Postgres. Unread counts are best-effort (updates after transaction commit).
 - **Both WebSocket and SSE**: WebSocket is preferred for bidirectional use cases; SSE works across proxies/CDNs that buffer WebSocket upgrades.
-- **Rate limiting via Redis INCR/EXPIRE**: Simple sliding-window approximation. A production system might use a token bucket or a dedicated rate-limit library.
+- **Rate limiting via Redis Lua script**: Atomic fixed-window rate limiting with a single round-trip. Each user has a per-minute quota enforced via `INCR` and `EXPIRE`.
 - **Graceful shutdown**: All services listen for SIGINT/SIGTERM, drain in-flight work, and close connections cleanly.
 - **Structured logging (slog)**: JSON log lines are easy to ingest into Datadog, CloudWatch, or any log aggregator.
 - **No global metrics registry**: The `/metrics` endpoint exposes a minimal counter sufficient for the demo. A real deployment would integrate `prometheus/client_golang`.
